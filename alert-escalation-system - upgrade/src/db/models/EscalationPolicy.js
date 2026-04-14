@@ -1,0 +1,28 @@
+const { DataTypes } = require('sequelize');
+const sequelize = require('../index');
+
+const EscalationPolicy = sequelize.define('EscalationPolicy', {
+  rule_id: {
+    type: DataTypes.INTEGER,
+    allowNull: false
+  },
+  level: {
+    type: DataTypes.INTEGER,
+    allowNull: false
+  },
+  escalate_after_minutes: {
+    type: DataTypes.INTEGER,
+    allowNull: false
+  },
+  notify_via: {
+    type: DataTypes.STRING
+  },
+  notify_to: {
+    type: DataTypes.STRING
+  }
+}, {
+  tableName: 'escalation_policies',
+  timestamps: false
+});
+
+module.exports = EscalationPolicy;
