@@ -1,78 +1,81 @@
 require('dotenv').config();
 const express = require('express');
+const cors = require('cors');
+const { getCorsOptions, getJsonBodyLimit } = require('./config/env');
+const { requireApiKey, requireIngestKey } = require('./middleware/auth');
+const metrics = require('./observability/metrics');
+const logger = require('./utils/logger');
 
-const cors = require("cors");
-const app = express();
+function createApp() {
+  const app = express();
+  if (process.env.TRUST_PROXY === 'true') {
+    app.set('trust proxy', 1);
+  }
 
-/* ---------- MIDDLEWARE ---------- */
+  app.use(cors(getCorsOptions()));
+  app.use(express.json({ limit: getJsonBodyLimit() }));
 
-app.use(cors());              // enable CORS FIRST
-app.use(express.json());      // parse JSON
-
-/* ------------------ ROUTES ------------------ */
-
-// Health check route
-app.get('/health', (req, res) => {
-  res.send('Alert Escalation System is running');
-});
-
-// Ingestion routes
-const ingestionRoutes = require('./ingestion/ingestion.routes');
-app.use('/api', ingestionRoutes);
-
-/* ------------------ DATABASE ------------------ */
-
-const sequelize = require('./db');
-const Device = require('./db/models/Device');
-const Rule = require('./db/models/Rule');
-require('./ingestion/redis');
-/* ------------------ CONNECT DB & START SERVER ------------------ */
-
-sequelize.authenticate()
-  .then(async () => {
-    console.log('PostgreSQL connected successfully');
-
-    // Fetch devices and rules (merged logic)
-    const devices = await Device.findAll();
-    const rules = await Rule.findAll();
-
-    console.log('Devices count:', devices.length);
-    console.log('Rules count:', rules.length);
-    console.log('Device IDs:', devices.map(d => d.device_id));
-    console.log('Rule parameters:', rules.map(r => r.parameter));
-
-    // Start server only after DB connection
-    app.listen(5000, () => {
-      console.log('Server running on port 5000');
-    });
-  })
-  .catch(err => {
-    console.error('DB connection failed:', err);
+  app.get('/health', (_req, res) => {
+    res.status(200).json({ status: 'ok' });
   });
-  const { loadRules } = require('./rules/ruleCache');
-  (async () => {
-    await loadRules();
-  })();
 
-const adminDeviceRoutes = require('./admin/device.routes');
-const adminRuleRoutes = require('./admin/rule.routes');
+  app.get('/ready', async (_req, res) => {
+    try {
+      const sequelize = require('./db');
+      const redis = require('./ingestion/redis');
+      await sequelize.authenticate();
+      const pong = await redis.ping();
+      if (pong !== 'PONG') {
+        throw new Error('Redis ping unexpected response');
+      }
+      res.status(200).json({
+        status: 'ready',
+        checks: { database: true, redis: true }
+      });
+    } catch (err) {
+      logger.error('ready_check_failed', { error: err.message });
+      res.status(503).json({
+        status: 'not_ready',
+        error: 'dependency_unavailable'
+      });
+    }
+  });
 
-app.use('/api/admin', adminDeviceRoutes);
-app.use('/api/admin', adminRuleRoutes);
-//require('./scheduler/alert.scheduler');
-require('./scheduler/escalation.scheduler');
-app.use('/api/admin', require('./admin/escalation.routes'));
-app.use('/api/alerts', require('./alerts/alert.routes'));
+  const metricsHandler = (_req, res) => {
+    res.status(200).json(metrics.snapshot());
+  };
+  if (process.env.METRICS_REQUIRE_AUTH === 'true') {
+    app.get('/metrics', requireApiKey, metricsHandler);
+  } else {
+    app.get('/metrics', metricsHandler);
+  }
 
+  const ingestionRoutes = require('./ingestion/ingestion.routes');
+  app.use('/api', requireIngestKey, ingestionRoutes);
 
-//Fetch all rules
-const rulesController = require('./rules/rules.controller');
-app.use('/api/rules', rulesController);
+  const adminDeviceRoutes = require('./admin/device.routes');
+  const adminRuleRoutes = require('./admin/rule.routes');
+  const adminEscalationRoutes = require('./admin/escalation.routes');
+  const adminQueueRoutes = require('./admin/queue.routes');
+  app.use('/api/admin', requireApiKey, adminDeviceRoutes);
+  app.use('/api/admin', requireApiKey, adminRuleRoutes);
+  app.use('/api/admin', requireApiKey, adminEscalationRoutes);
+  app.use('/api/admin', requireApiKey, adminQueueRoutes);
 
-// Device management routes
-const deviceRoutes = require('./devices/device.routes');
-app.use('/api/devices', deviceRoutes);
+  const rulesController = require('./rules/rules.controller');
+  app.use('/api/rules', requireApiKey, rulesController);
 
-// Start telemetry worker
-const telemetryWorker = require('./ingestion/telemetry.worker');
-telemetryWorker();
+  const deviceRoutes = require('./devices/device.routes');
+  app.use('/api/devices', requireApiKey, deviceRoutes);
+
+  app.use('/api/alerts', requireApiKey, require('./alerts/alert.routes'));
+
+  app.use((err, _req, res, _next) => {
+    logger.error('unhandled_http_error', { error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  });
+
+  return app;
+}
+
+module.exports = { createApp };

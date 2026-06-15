@@ -1,24 +1,16 @@
+const axios = require('axios');
 const { evaluate } = require('../rules/rules.service');
 
-/**
- * Random number generator
- */
-function randomValue(min = 1, max = 100) {
+function randomValue(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-/**
- * Generate ALL metrics (real device payload)
- */
-function generateMetrics() {
+function metrics(forceViolation) {
   return {
-    // 🔥 ENABLED METRICS (force violations sometimes)
-    temperature: randomValue(0, 100)  ,
-    pressure: randomValue(1, 100),
+    temperature: forceViolation ? 200 : randomValue(0, 100),
+    pressure: forceViolation ? 200 : randomValue(1, 100),
     vibration: 30,
     humidity: randomValue(1, 100),
-
-    // ❌ DISABLED METRICS (random → should be ignored)
     voltage: randomValue(100, 700),
     current: randomValue(1, 20),
     rpm: randomValue(1, 20),
@@ -29,47 +21,47 @@ function generateMetrics() {
   };
 }
 
-/**
- * Generate packetId (same for a short window → simulates duplicates)
- */
-function generatePacketId(deviceId) {
-  // Same ID for 5 seconds → simulates retries
-  return `${deviceId}-${Math.floor(Date.now() / 5000)}`;
+function packet(deviceId) {
+  const force = process.env.SIM_FORCE_VIOLATION === 'true';
+  return {
+    packetId: `${deviceId}-${Math.floor(Date.now() / 5000)}`,
+    deviceId: String(deviceId),
+    metrics: metrics(force),
+    timestamp: Date.now()
+  };
 }
 
-/**
- * Start simulator
- */
-function startDeviceSimulator(deviceIds = []) {
+async function sendHttp(p, baseUrl, ingestKey) {
+  const url = `${String(baseUrl).replace(/\/$/, '')}/api/ingest`;
+  const headers = { 'Content-Type': 'application/json' };
+  if (ingestKey) headers['x-ingest-key'] = ingestKey;
+  const res = await axios.post(url, p, { headers, timeout: 15000 });
+  return res.data;
+}
 
-  console.log(`🚀 Starting simulator for devices: ${deviceIds.join(", ")}`);
+function startDeviceSimulator(deviceIds, opts = {}) {
+  const mode = opts.mode || process.env.SIM_MODE || 'http';
+  const ms = Number(opts.intervalMs || process.env.SIM_INTERVAL_MS || 5000);
+  const base = opts.apiBaseUrl || process.env.API_BASE_URL || 'http://localhost:5000';
+  const key = opts.ingestKey ?? process.env.INGEST_API_KEY;
 
-  setInterval(async () => {
-
-    for (const deviceId of deviceIds) {
-
-      const metrics = generateMetrics();
-
-      const packet = {
-        packetId: generatePacketId(deviceId), // ✅ important
-        deviceId,
-        metrics,
-        timestamp: Date.now()
-      };
-
-      console.log(`📦 Device ${deviceId} Packet:`, packet);
-
+  const tick = async () => {
+    for (const id of deviceIds) {
+      const p = packet(id);
       try {
-        // 🔥 Send SAME packet twice → simulate retry/duplicate
-        await evaluate(packet);
-        //await evaluate(packet);
-
-      } catch (err) {
-        console.error(`Simulator error for device ${deviceId}:`, err);
+        if (mode === 'direct') {
+          await evaluate(p);
+        } else {
+          await sendHttp(p, base, key);
+        }
+      } catch (e) {
+        console.error('simulator', id, e.message);
       }
     }
+  };
 
-  }, 5000); // every 5 seconds
+  tick();
+  return setInterval(tick, ms);
 }
 
-module.exports = { startDeviceSimulator };
+module.exports = { startDeviceSimulator, packet };

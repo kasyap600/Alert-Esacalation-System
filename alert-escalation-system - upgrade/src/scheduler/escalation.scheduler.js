@@ -2,12 +2,13 @@ const cron = require('node-cron');
 const redis = require('../ingestion/redis'); 
 const Alert = require('../db/models/Alert');
 const EscalationPolicy = require('../db/models/EscalationPolicy');
+const AlertEscalation = require('../db/models/AlertEscalation');
+const logger = require('../utils/logger');
 
-cron.schedule('* * * * *', async () => {
+function startEscalationScheduler() {
+  return cron.schedule('* * * * *', async () => {
 
-  console.log('======================================');
-  console.log('Escalation scheduler running at:', new Date().toISOString());
-  console.log('======================================');
+  logger.info('escalation_scheduler_tick');
 
   try {
 
@@ -15,7 +16,7 @@ cron.schedule('* * * * *', async () => {
       where: { status: ['OPEN', 'ACKNOWLEDGED'] }
     });
 
-    console.log('Open alerts found:', alerts.length);
+    logger.info('open_alerts_found', { count: alerts.length });
 
     const now = new Date();
 
@@ -23,21 +24,8 @@ cron.schedule('* * * * *', async () => {
 
       try {
 
-        console.log('--------------------------------------');
-        console.log('Processing alert ID:', alert.id);
-        console.log('Current level:', alert.current_level);
-        console.log('Rule ID:', alert.rule_id);
-
         if (!alert.rule_id) {
-          console.log('Skipping alert — no rule_id');
-          continue;
-        }
-
-        // Auto-close resolved alerts
-        if (alert.status === 'RESOLVED') {
-          alert.status = 'CLOSED';
-          await alert.save();
-          console.log(`Alert ${alert.id} closed`);
+          logger.warn('skipping_alert_without_rule', { alertId: alert.id });
           continue;
         }
 
@@ -47,10 +35,8 @@ cron.schedule('* * * * *', async () => {
           order: [['level', 'ASC']]
         });
 
-        console.log('Policies found:', policies.length);
-
         if (!policies.length) {
-          console.log('No escalation policies configured');
+          logger.info('no_escalation_policies', { alertId: alert.id, ruleId: alert.rule_id });
           continue;
         }
 
@@ -61,11 +47,7 @@ cron.schedule('* * * * *', async () => {
           p => p.level === nextLevel
         );
 
-        console.log('Next level expected:', nextLevel);
-        console.log('Next policy found:', nextPolicy ? 'YES' : 'NO');
-
         if (!nextPolicy) {
-          console.log('No next escalation level. Skipping.');
           continue;
         }
 
@@ -78,12 +60,7 @@ cron.schedule('* * * * *', async () => {
         const minutesElapsed =
           (now - referenceTime) / 60000;
 
-        console.log('Minutes elapsed:', minutesElapsed);
-        console.log('Escalate after minutes:', nextPolicy.escalate_after_minutes);
-
-        // 🚨 ESCALATION CONDITION
         if (minutesElapsed >= nextPolicy.escalate_after_minutes) {
-          // 🔒 Acquire lock to prevent duplicate escalations
           const lockKey = `escalation:${alert.id}:${nextLevel}`;
           const lock = await redis.set(
             lockKey,
@@ -93,13 +70,14 @@ cron.schedule('* * * * *', async () => {
             120
           );
           if (!lock) {
-            console.log('⚠️ Escalation already triggered. Skipping.');
             continue;
           }
-
-          console.log('🚨 Escalation condition met. Publishing event...');
-
-          // ✅ Publish event instead of sending directly
+          const alreadyEscalated = await AlertEscalation.findOne({
+            where: { alert_id: alert.id, level: nextPolicy.level }
+          });
+          if (alreadyEscalated) {
+            continue;
+          }
           await redis.publish(
             'notification-events',
             JSON.stringify({
@@ -130,29 +108,25 @@ cron.schedule('* * * * *', async () => {
             })
           );
 
-          // Update alert escalation level
+          await AlertEscalation.create({
+            alert_id: alert.id,
+            level: nextPolicy.level,
+            notified_at: now
+          });
           alert.current_level = nextPolicy.level;
           alert.last_updated_at = now;
           await alert.save();
-
-          console.log(`✅ Alert ${alert.id} escalated to level ${nextPolicy.level}`);
-
-        } else {
-
-          console.log('⏳ Escalation condition NOT met yet.');
-
+          logger.info('alert_escalated', { alertId: alert.id, level: nextPolicy.level });
         }
-
       } catch (alertError) {
-
-        console.error(`❌ Error processing alert ${alert.id}:`, alertError.message);
-
+        logger.error('escalation_alert_error', { alertId: alert.id, error: alertError.message });
       }
     }
 
   } catch (error) {
-
-    console.error('❌ Scheduler failed:', error.message);
-
+    logger.error('escalation_scheduler_failed', { error: error.message });
   }
-});
+  });
+}
+
+module.exports = { startEscalationScheduler };

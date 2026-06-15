@@ -10,23 +10,35 @@ const Rule = sequelize.define('Rule', {
   },
 
   device_id: {
-    type: DataTypes.INTEGER,
-    allowNull: false
+    type: DataTypes.STRING(100),
+    allowNull: false,
+    validate: {
+      notEmpty: true
+    }
   },
 
   metric_name: {
-    type: DataTypes.STRING,
-    allowNull: false
+    type: DataTypes.STRING(100),
+    allowNull: false,
+    validate: {
+      notEmpty: true
+    }
   },
 
   min_value: {
     type: DataTypes.FLOAT,
-    allowNull: false
+    allowNull: false,
+    validate: {
+      isFloat: true
+    }
   },
 
   max_value: {
     type: DataTypes.FLOAT,
-    allowNull: false
+    allowNull: false,
+    validate: {
+      isFloat: true
+    }
   },
 
   packet_threshold: {
@@ -51,7 +63,16 @@ const Rule = sequelize.define('Rule', {
 
 }, {
   tableName: 'rules',
-  timestamps: false // or true if you have created_at/updated_at
+  timestamps: false,
+  indexes: [
+    {
+      unique: true,
+      fields: ['device_id', 'metric_name']
+    },
+    {
+      fields: ['enabled', 'device_id']
+    }
+  ]
 });
 
 module.exports = Rule;

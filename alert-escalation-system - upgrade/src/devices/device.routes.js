@@ -4,6 +4,8 @@ const router = express.Router();
 const {
   getAllDevices,
   createDevice,
+  updateDevice,
+  toggleDevice,
   deleteDevice
 } = require('./device.controller');
 
@@ -12,6 +14,12 @@ router.get('/', getAllDevices);
 
 // POST
 router.post('/', createDevice);
+
+// PUT update
+router.put('/:id', updateDevice);
+
+// PATCH toggle active
+router.patch('/:id/toggle', toggleDevice);
 
 // DELETE
 router.delete('/:id', deleteDevice);

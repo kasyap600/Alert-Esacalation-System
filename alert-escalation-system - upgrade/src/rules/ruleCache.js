@@ -8,7 +8,7 @@ async function loadRules() {
   ruleMap.clear();
 
   for (const rule of rules) {
-    const key = `${rule.device_id}:${rule.parameter}`;
+    const key = `${rule.device_id}:${rule.metric_name}`;
     ruleMap.set(key, rule);
   }
 

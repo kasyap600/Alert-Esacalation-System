@@ -1,34 +1,56 @@
+const crypto = require('crypto');
 const redis = require('../ingestion/redis');
 const alertService = require('../alerts/alert.service');
+const { Rule } = require('../db/models');
+const logger = require('../utils/logger');
+const TELEMETRY_PERSIST_STREAM = 'stream:telemetry:persist';
+
+function getPacketDedupeTtlSeconds() {
+  const raw = process.env.PACKET_DEDUPE_TTL_SECONDS;
+  if (raw === undefined || raw === '') return 120;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1) return 120;
+  return Math.min(Math.floor(n), 86400 * 7);
+}
+
+function getMetricEvalConcurrency() {
+  const raw = process.env.METRIC_EVAL_CONCURRENCY;
+  if (raw === undefined || raw === '') return 8;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1) return 8;
+  return Math.min(Math.floor(n), 64);
+}
+
+async function runWithConcurrency(items, concurrency, fn) {
+  if (!items.length) return;
+  const limit = Math.min(concurrency, items.length);
+  let index = 0;
+  async function worker() {
+    while (index < items.length) {
+      const i = index++;
+      await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: limit }, () => worker()));
+}
 
 /**
  * Store raw telemetry packet in Redis Stream
  */
 async function storeRawPacket(packet) {
   const { deviceId, metrics, timestamp } = packet;
-
   const streamKey = `telemetry:device:${deviceId}`;
-
-  try {
-    await redis.xadd(
-      streamKey,
-      '*',
-      'deviceId',
-      deviceId,
-      'metrics',
-      JSON.stringify(metrics),
-      'timestamp',
-      timestamp
-    );
-  } catch (err) {
-    console.error('Redis stream store error:', err);
-  }
+  await redis.xadd(
+    streamKey,
+    '*',
+    'deviceId',
+    deviceId,
+    'metrics',
+    JSON.stringify(metrics),
+    'timestamp',
+    String(timestamp)
+  );
 }
-
-
-
-//TO check for duplicates packets
-const crypto = require('crypto');
 
 function generatePacketId(packet) {
   return crypto
@@ -43,16 +65,96 @@ function generatePacketId(packet) {
 
 async function isDuplicatePacket(packetId) {
   const key = `packet:${packetId}`;
+  const ttlSec = getPacketDedupeTtlSeconds();
 
   const result = await redis.set(
     key,
     1,
-    'NX',   // only set if not exists
+    'NX',
     'EX',
-    120     // 2 minutes TTL
+    ttlSec
   );
 
   return result === null;
+}
+
+function normalizeRuleRecord(rule) {
+  return {
+    ruleId: rule.id,
+    min: Number(rule.min_value),
+    max: Number(rule.max_value),
+    packet_threshold: Number(rule.packet_threshold || 1),
+    duration_minutes: Number(rule.duration_minutes || 0),
+    severity: rule.severity || 'HIGH'
+  };
+}
+
+async function cacheRule(rule) {
+  if (!rule.enabled) {
+    await redis.hdel(`rules:${rule.device_id}`, rule.metric_name);
+    return;
+  }
+  await redis.hset(
+    `rules:${rule.device_id}`,
+    rule.metric_name,
+    JSON.stringify(normalizeRuleRecord(rule))
+  );
+}
+
+async function loadDeviceRulesToCache(deviceId) {
+  const rules = await Rule.findAll({
+    where: { device_id: deviceId, enabled: true }
+  });
+  if (!rules.length) return {};
+  const entries = {};
+  for (const rule of rules) {
+    entries[rule.metric_name] = JSON.stringify(normalizeRuleRecord(rule));
+  }
+  await redis.hmset(`rules:${deviceId}`, entries);
+  return entries;
+}
+
+async function getRulesForDevice(deviceId) {
+  let rules = await redis.hgetall(`rules:${deviceId}`);
+  if (!rules || Object.keys(rules).length === 0) {
+    rules = await loadDeviceRulesToCache(deviceId);
+  }
+  return rules;
+}
+
+async function enqueueTelemetry(packet) {
+  const { deviceId, metrics, timestamp = Date.now(), packetId } = packet;
+  if (!deviceId || !metrics || typeof metrics !== 'object') {
+    throw new Error('Invalid telemetry packet payload');
+  }
+  const finalPacketId = packetId || generatePacketId({ deviceId, metrics, timestamp });
+  await redis.xadd(
+    'stream:telemetry:ingest',
+    '*',
+    'packetId',
+    finalPacketId,
+    'deviceId',
+    String(deviceId),
+    'timestamp',
+    String(timestamp),
+    'metrics',
+    JSON.stringify(metrics)
+  );
+  return finalPacketId;
+}
+
+async function enqueueTelemetryForPersistence(packet) {
+  const { deviceId, metrics, timestamp } = packet;
+  await redis.xadd(
+    TELEMETRY_PERSIST_STREAM,
+    '*',
+    'deviceId',
+    String(deviceId),
+    'timestamp',
+    String(timestamp),
+    'metrics',
+    JSON.stringify(metrics)
+  );
 }
 
 
@@ -60,8 +162,6 @@ async function isDuplicatePacket(packetId) {
  * Multi-metric evaluation
  */
 async function evaluate(packet) {
-
-
   let { packetId, deviceId, metrics, timestamp = Date.now() } = packet;
 
   if (!deviceId || !metrics) return;
@@ -70,40 +170,35 @@ async function evaluate(packet) {
     packetId = generatePacketId({ deviceId, metrics, timestamp });
   }
   // ✅ Check duplicate
-  const isDuplicate = await isDuplicatePacket(packetId);
-  if (isDuplicate) {
-    console.log(`⚠️ Duplicate packet skipped: ${packetId}`);
+  const duplicate = await isDuplicatePacket(packetId);
+  if (duplicate) {
+    logger.info('duplicate_packet_skipped', { packetId, deviceId });
     return;
   }
   try {
-
-    // Store raw packet
-    await redis.lpush(
-    'telemetryQueue',
-    JSON.stringify({ deviceId, metrics, timestamp })
-    );
-
-    // Update device heartbeat
+    await storeRawPacket({ deviceId, metrics, timestamp });
+    await enqueueTelemetryForPersistence({ deviceId, metrics, timestamp });
     await redis.set(`device:lastSeen:${deviceId}`, timestamp, 'EX', 90);
-
-    // Fetch rules for device
-    const rules = await redis.hgetall(`rules:${deviceId}`);
-
+    const rules = await getRulesForDevice(deviceId);
     if (!rules || Object.keys(rules).length === 0) {
-      console.log(`No rules configured for device ${deviceId}`);
+      logger.info('no_rules_for_device', { deviceId });
       return;
     }
-
-    const tasks = Object.entries(metrics).map(
-      ([metric, value]) =>
-        processMetric(deviceId, metric, value, timestamp, rules[metric])
-    );
-
-    await Promise.all(tasks);
-
+    const entries = Object.entries(metrics);
+    const concurrency = getMetricEvalConcurrency();
+    await runWithConcurrency(entries, concurrency, async ([metric, value]) => {
+      await processMetric(deviceId, metric, value, timestamp, rules[metric]);
+    });
   } catch (error) {
-    console.error('Rule evaluation error:', error);
+    logger.error('rule_evaluation_error', { error: error.message, deviceId, packetId });
   }
+}
+
+/**
+ * Canonical entrypoint for all ingestion paths
+ */
+async function evaluateFromIngestion(packet) {
+  await evaluate(packet);
 }
 
 
@@ -111,63 +206,35 @@ async function evaluate(packet) {
  * Metric rule processing
  */
 async function processMetric(deviceId, metric, value, timestamp, ruleData) {
-
   if (!ruleData) return;
-
-  const rule = JSON.parse(ruleData);
-
+  let rule;
+  try {
+    rule = JSON.parse(ruleData);
+  } catch (e) {
+    logger.error('rule_cache_corrupt', { deviceId, metric, error: e.message });
+    return;
+  }
   const violationKey = `violation:${deviceId}:${metric}`;
   const activeKey = `alert:active:${deviceId}:${metric}`;
-  const breachKey = `breach:${deviceId}:${metric}`; // ✅ NEW
-
+  const breachKey = `breach:${deviceId}:${metric}`;
   const outOfRange = value < rule.min || value > rule.max;
 
   try {
-
-    // ----------- CASE 1: VIOLATION -------------
-
     if (outOfRange) {
-
-      // Increment violation counter
       const count = await redis.incr(violationKey);
       await redis.expire(violationKey, 300);
-
-      // Get or set breach start time
       let breachStart = await redis.get(breachKey);
-
       if (!breachStart) {
         breachStart = timestamp;
         await redis.set(breachKey, breachStart);
       }
-
-      const elapsedMinutes =
-        (timestamp - parseInt(breachStart)) / (1000 * 60);
-
-      console.log(
-        `⚠️ ${deviceId}:${metric} count=${count}/${rule.packet_threshold} | time=${elapsedMinutes.toFixed(2)}/${rule.duration_minutes || 0}`
-      );
-
-      // ✅ HYBRID CONDITION
-      const durationCondition =
-        !rule.duration_minutes || rule.duration_minutes === 0
-          ? true
-          : elapsedMinutes >= rule.duration_minutes;
-
-      if (
-        count >= rule.packet_threshold &&
-        durationCondition
-      ) {
-        
-        const lock = await redis.set(
-          activeKey,
-          'LOCK',
-          'NX',
-          'EX',
-          300
-        );
-
+      const elapsedMinutes = (timestamp - parseInt(breachStart, 10)) / (1000 * 60);
+      const durationCondition = !rule.duration_minutes || rule.duration_minutes === 0
+        ? true
+        : elapsedMinutes >= rule.duration_minutes;
+      if (count >= rule.packet_threshold && durationCondition) {
+        const lock = await redis.set(activeKey, 'LOCK', 'NX', 'EX', 300);
         if (!lock) return;
-
         const alertId = await alertService.createAlert({
           ruleId: rule.ruleId,
           deviceId,
@@ -177,215 +244,65 @@ async function processMetric(deviceId, metric, value, timestamp, ruleData) {
           max: rule.max,
           severity: rule.severity
         });
-        
-        // Replace LOCK with actual alertId
         await redis.set(activeKey, alertId);
-
         await redis.del(violationKey);
         await redis.del(breachKey);
-
-        console.log(`🚨 Alert created for ${deviceId}:${metric}`);
+        logger.info('alert_created', { deviceId, metric, alertId });
       }
-
-    }
-
-    // ----------- CASE 2: NORMAL -------------
-
-    else {
-
+    } else {
       await redis.del(violationKey);
-      await redis.del(breachKey); // ✅ NEW
-
-      const activeAlertId = await redis.get(activeKey);
-
-      if (activeAlertId && activeAlertId !== 'LOCK') {
-
-        await alertService.resolveAlert(activeAlertId);
-        await redis.del(activeKey);
-
-        console.log(`✅ Alert resolved for ${deviceId}:${metric}`);
-      }
-    }
-
-  } catch (error) {
-    console.error(`Error processing metric ${metric}:`, error);
-  }
-}
-
-/**
- * Legacy rule evaluation (DB rule object)
- */
-async function processTelemetry(rule, value) {
-
-  const {
-    id: ruleId,
-    device_id: deviceId,
-    metric_name: metric,
-    min_value: min,
-    max_value: max,
-    duration_minutes,
-    severity
-  } = rule;
-
-  const breachKey = `breach:${deviceId}:${metric}`;
-  const activeKey = `alert:active:${deviceId}:${metric}`;
-  const timestamp = Date.now();
-
-  const outOfRange = value < min || value > max;
-
-  try {
-
-    if (outOfRange) {
-
-      const activeAlertId = await redis.get(activeKey);
-      if (activeAlertId) return;
-
-      const breachStart = await redis.get(breachKey);
-
-      if (!breachStart) {
-
-        console.log(`⏳ Breach started for ${deviceId}:${metric}`);
-
-        await redis.set(breachKey, timestamp);
-
-        return;
-      }
-
-      const elapsedMinutes =
-        (timestamp - parseInt(breachStart)) / (1000 * 60);
-
-      console.log(
-        `⏱ ${deviceId}:${metric} elapsed = ${elapsedMinutes.toFixed(2)} min | required = ${duration_minutes}`
-      );
-
-      if (elapsedMinutes >= duration_minutes) {
-
-        const alertId = await alertService.createAlert({
-          ruleId,
-          deviceId,
-          metric,
-          value,
-          min,
-          max,
-          severity
-        });
-
-        await redis.set(activeKey, alertId);
-
-        await redis.del(breachKey);
-
-        console.log(`🚨 Alert created for ${deviceId}:${metric}`);
-      }
-
-    }
-
-    else {
-
       await redis.del(breachKey);
-
       const activeAlertId = await redis.get(activeKey);
-
-      if (activeAlertId) {
-
+      if (activeAlertId && activeAlertId !== 'LOCK') {
         await alertService.resolveAlert(activeAlertId);
-
         await redis.del(activeKey);
-
-        console.log(`✅ Alert resolved for ${deviceId}:${metric}`);
+        logger.info('alert_resolved', { deviceId, metric, alertId: activeAlertId });
       }
     }
-
   } catch (error) {
-
-    console.error(`Error processing telemetry for ${metric}:`, error);
+    logger.error('process_metric_error', {
+      error: error.message,
+      deviceId,
+      metric
+    });
   }
 }
-const { Rule } = require('../db/models');
 
 /**
  * Fetch all rules
  */
 async function getAllRules() {
-
-  const rules = await Rule.findAll({
+  return Rule.findAll({
     order: [
       ['device_id', 'ASC'],
       ['metric_name', 'ASC']
     ]
   });
-
-  return rules;
 }
 
 /**
  * Fetch rule by ID
  */
 async function getRuleById(ruleId) {
-
-  const rule = await Rule.findByPk(ruleId);
-
-  return rule;
-
+  return Rule.findByPk(ruleId);
 }
-
-
-const ruleCache = require('./ruleCache');
 
 /**
  * Create rule
  */
 async function createRule(data) {
-
-  const {
-    deviceId,
-    metricName,
-    minValue,
-    maxValue,
-    packetThreshold,
-    durationMinutes,
-    severity,
-    enabled
-  } = data;
-
-  // Save to DB
+  const enabled = data.enabled === undefined ? true : Boolean(data.enabled);
   const rule = await Rule.create({
-    device_id: deviceId,
-    metric_name: metricName,
-    min_value: minValue,
-    max_value: maxValue,
-    packet_threshold: Number(packetThreshold),
-    duration_minutes: durationMinutes || 1,
-    severity,
+    device_id: String(data.deviceId),
+    metric_name: data.metricName,
+    min_value: Number(data.minValue),
+    max_value: Number(data.maxValue),
+    packet_threshold: Number(data.packetThreshold || 1),
+    duration_minutes: Number(data.durationMinutes || 0),
+    severity: data.severity || 'HIGH',
     enabled
   });
-
-  // If enabled → update Redis + memory cache
-  if (enabled) {
-
-    const ruleData = {
-      ruleId: rule.id,
-      min: minValue,
-      max: maxValue,
-      packet_threshold: packetThreshold,
-      duration_minutes: durationMinutes || 1,
-      severity
-    };
-
-    // Redis cache
-    await redis.hset(
-      `rules:${deviceId}`,
-      metricName,
-      JSON.stringify(ruleData)
-    );
-
-    // Memory cache
-    if (!ruleCache[deviceId]) {
-      ruleCache[deviceId] = {};
-    }
-
-    ruleCache[deviceId][metricName] = ruleData;
-  }
-
+  await cacheRule(rule);
   return rule;
 }
 
@@ -393,86 +310,42 @@ async function createRule(data) {
  * Update rule
  */
 async function updateRule(ruleId, data) {
-
-  const {
-    minValue,
-    maxValue,
-    packetThreshold,
-    durationMinutes,
-    severity,
-    enabled
-  } = data;
-
   const rule = await Rule.findByPk(ruleId);
-
   if (!rule) return null;
 
-  // Update DB fields
-  rule.min_value = minValue;
-  rule.max_value = maxValue;
-  rule.packet_threshold = Number(packetThreshold);
-  rule.duration_minutes = durationMinutes || 1;
-  rule.severity = severity;
-  rule.enabled = enabled;
+  if (data.minValue !== undefined) rule.min_value = Number(data.minValue);
+  if (data.maxValue !== undefined) rule.max_value = Number(data.maxValue);
+  if (data.packetThreshold !== undefined) rule.packet_threshold = Number(data.packetThreshold);
+  if (data.durationMinutes !== undefined) rule.duration_minutes = Number(data.durationMinutes);
+  if (data.severity !== undefined) rule.severity = data.severity;
+  if (data.enabled !== undefined) rule.enabled = Boolean(data.enabled);
 
   await rule.save();
-
-  const deviceId = rule.device_id;
-  const metricName = rule.metric_name;
-
-  const ruleData = {
-    ruleId: rule.id,
-    min: rule.min_value,
-    max: rule.max_value,
-    packet_threshold: rule.packet_threshold,
-    duration_minutes: rule.duration_minutes,
-    severity: rule.severity
-  };
-
-  // ---------- Redis Cache Update ----------
-
-  if (enabled) {
-
-    await redis.hset(
-      `rules:${deviceId}`,
-      metricName,
-      JSON.stringify(ruleData)
-    );
-
-  } else {
-
-    await redis.hdel(
-      `rules:${deviceId}`,
-      metricName
-    );
-
-  }
-
-  // ---------- Memory Cache Update ----------
-
-  if (!ruleCache[deviceId]) {
-    ruleCache[deviceId] = {};
-  }
-
-  if (enabled) {
-
-    ruleCache[deviceId][metricName] = ruleData;
-
-  } else {
-
-    delete ruleCache[deviceId][metricName];
-
-  }
-
+  await cacheRule(rule);
   return rule;
 }
 
+/**
+ * Delete rule and refresh Redis cache for the device.
+ */
+async function deleteRule(ruleId) {
+  const rule = await Rule.findByPk(ruleId);
+  if (!rule) return null;
+
+  const { device_id: deviceId } = rule;
+  await rule.destroy();
+  await redis.del(`rules:${deviceId}`);
+  await loadDeviceRulesToCache(deviceId);
+  return true;
+}
 
 module.exports = {
+  enqueueTelemetry,
   evaluate,
-  processTelemetry,
+  evaluateFromIngestion,
   getAllRules,
   getRuleById,
   createRule,
-  updateRule
+  updateRule,
+  deleteRule
 };

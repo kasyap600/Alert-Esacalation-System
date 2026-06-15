@@ -1,11 +1,29 @@
 {
   "name": "alert-escalation-system",
   "version": "1.0.0",
-  "description": "",
+  "description": "IoT alert backend — optimized for local development first",
   "main": "index.js",
   "scripts": {
-    "start": "node src/app.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node src/server.js",
+    "start:api": "node src/server.js",
+    "start:rule-worker": "node src/workers/rule-eval.worker.js",
+    "start:telemetry-worker": "node src/workers/telemetry.worker.js",
+    "start:escalation-worker": "node src/workers/escalation.worker.js",
+    "start:notification-worker": "node src/workers/notification.worker.js",
+    "start:all": "node src/server.js",
+    "local:api": "node src/server.js",
+    "local:rule-worker": "node src/workers/rule-eval.worker.js",
+    "local:telemetry-worker": "node src/workers/telemetry.worker.js",
+    "local:escalation-worker": "node src/workers/escalation.worker.js",
+    "local:notification-worker": "node src/workers/notification.worker.js",
+    "local:simulate": "node src/scripts/runSimulator.js",
+    "local:stack": "concurrently -k -n api,rule -c blue,magenta \"npm run local:api\" \"npm run local:rule-worker\"",
+    "local:stack:full": "concurrently -k -n api,rule,tel,notif,esc -c blue,magenta,green,yellow,cyan \"npm run local:api\" \"npm run local:rule-worker\" \"npm run local:telemetry-worker\" \"npm run local:notification-worker\" \"npm run local:escalation-worker\"",
+    "migrate:prod": "node src/scripts/runMigrations.js",
+    "loadtest:1000": "node src/loadtest/simulate1000Devices.js",
+    "simulate:devices": "node src/scripts/runSimulator.js",
+    "dev": "node src/scripts/runSimulator.js",
+    "test": "node -e \"console.log('No automated tests configured yet')\""
   },
   "keywords": [],
   "author": "",
@@ -23,5 +41,8 @@
     "pg-hstore": "^2.3.4",
     "sequelize": "^6.37.7",
     "twilio": "^5.13.1"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
   }
 }

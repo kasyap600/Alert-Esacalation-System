@@ -22,7 +22,13 @@ const EscalationPolicy = sequelize.define('EscalationPolicy', {
   }
 }, {
   tableName: 'escalation_policies',
-  timestamps: false
+  timestamps: false,
+  indexes: [
+    {
+      unique: true,
+      fields: ['rule_id', 'level']
+    }
+  ]
 });
 
 module.exports = EscalationPolicy;

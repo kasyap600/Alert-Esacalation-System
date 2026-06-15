@@ -1,5 +1,7 @@
 const Alert = require('../db/models/Alert');
 const EscalationPolicy = require('../db/models/EscalationPolicy');
+const redis = require('../ingestion/redis');
+const logger = require('../utils/logger');
 
 async function createAlert(data) {
   const alert = await Alert.create({
@@ -31,22 +33,31 @@ async function createAlert(data) {
   const email = policy?.notify_to;
 
   if (!email) {
-    console.error('❌ No user/email mapped to device');
+    logger.warn('alert_no_escalation_policy_email', {
+      alertId: alert.id,
+      ruleId: data.ruleId,
+      hint: 'Add EscalationPolicy level 0 with notify_to for this rule to receive notifications.'
+    });
     return alert.id;
   }
 
-  // 🔥 Publish notification
-  await redis.publish('notification-events', JSON.stringify({
-    event: 'ALERT_CREATED',
-    alertId: alert.id,
-    deviceId: data.deviceId,
-    metric: data.metric,
-    severity: data.severity,
-    notifyTo: email,
-    notifyVia: policy.notify_via || 'EMAIL'
-  }));
-
-  console.log(`📡 Notification sent to ${email}`); 
+  try {
+    await redis.publish('notification-events', JSON.stringify({
+      event: 'ALERT_CREATED',
+      alertId: alert.id,
+      deviceId: data.deviceId,
+      metric: data.metric,
+      value: data.value,
+      min: data.min,
+      max: data.max,
+      severity: data.severity,
+      notifyTo: email,
+      notifyVia: policy.notify_via || 'EMAIL'
+    }));
+    logger.info('notification_published', { alertId: alert.id, notifyTo: email });
+  } catch (err) {
+    logger.error('notification_publish_failed', { alertId: alert.id, error: err.message });
+  }
 
   return alert.id;
 }
@@ -61,6 +72,7 @@ async function resolveAlert(alertId) {
   alert.last_updated_at = new Date();
 
   await alert.save();
+  logger.info('alert_resolved_db', { alertId });
 }
 
 async function acknowledgeAlert(alertId, acknowledgedBy) {

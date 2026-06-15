@@ -73,7 +73,12 @@ const Alert = sequelize.define('Alert', {
 
 }, {
   tableName: 'alerts',
-  timestamps: false
+  timestamps: false,
+  indexes: [
+    { fields: ['status', 'current_level'] },
+    { fields: ['device_id', 'metric_name'] },
+    { fields: ['rule_id'] }
+  ]
 });
 
 module.exports = Alert;

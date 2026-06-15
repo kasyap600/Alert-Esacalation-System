@@ -1,5 +1,32 @@
 const nodemailer = require('nodemailer');
 const redis = require('../ingestion/redis');
+const logger = require('../utils/logger');
+
+const NOTIFICATION_DLQ_STREAM = 'stream:notification:dlq';
+
+function getNotificationMaxRetries() {
+  const raw = process.env.NOTIFICATION_MAX_RETRIES;
+  if (raw === undefined || raw === '') return 3;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1) return 3;
+  return Math.min(Math.floor(n), 20);
+}
+
+async function pushNotificationDlq({ payload, error, attempts }) {
+  const event = payload.message || payload;
+  await redis.xadd(
+    NOTIFICATION_DLQ_STREAM,
+    '*',
+    'event',
+    JSON.stringify(event),
+    'error',
+    error?.message || String(error),
+    'attempts',
+    String(attempts),
+    'failedAt',
+    new Date().toISOString()
+  );
+}
 
 // ===============================
 // Create Transporter
@@ -19,9 +46,9 @@ const transporter = nodemailer.createTransport({
 // ===============================
 transporter.verify((error) => {
   if (error) {
-    console.error('❌ Email transporter error:', error);
+    logger.error('email_transporter_verify_failed', { error: error.message });
   } else {
-    console.log('✅ Email server ready');
+    logger.info('email_transporter_ready');
   }
 });
 
@@ -38,7 +65,7 @@ async function isRateLimited(event) {
   }
 
   if (count > 5) {
-    console.log('⚠️ Rate limited:', event.deviceId);
+    logger.warn('notification_rate_limited', { deviceId: event.deviceId });
     return true;
   }
 
@@ -51,24 +78,29 @@ async function isRateLimited(event) {
 async function sendNotification({ channel, to, message }) {
 
   if (channel !== 'EMAIL') {
-    console.log('⚠️ Unsupported channel. Skipping.');
+    logger.warn('notification_unsupported_channel', { channel });
     return;
   }
 
   if (!to) {
-    console.error('❌ Missing recipient');
+    logger.error('notification_missing_recipient', {});
     return;
   }
 
   const subject = `[ALERT] ${message.deviceId} - ${message.metric}`;
+
+  const thresholdText =
+    message.min != null && message.max != null
+      ? `${message.min} – ${message.max}`
+      : (message.threshold != null ? String(message.threshold) : 'n/a');
 
   const body = `
 Alert Triggered 🚨
 
 Device: ${message.deviceId}
 Metric: ${message.metric}
-Value: ${message.value}
-Threshold: ${message.threshold}
+Value: ${message.value != null ? message.value : 'n/a'}
+Threshold: ${thresholdText}
 
 Time: ${new Date().toISOString()}
 `;
@@ -80,27 +112,40 @@ Time: ${new Date().toISOString()}
     text: body
   });
 
-  console.log('✅ Email sent to', to);
+  logger.info('notification_email_sent', { to });
 }
 
 // ===============================
 // Retry Wrapper
 // ===============================
-async function sendWithRetry(payload, retries = 3) {
+async function sendWithRetry(payload) {
+  const retries = getNotificationMaxRetries();
+  let lastErr;
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       await sendNotification(payload);
-      console.log(`✅ Success on attempt ${attempt}`);
+      logger.info('notification_send_ok', { attempt, retries });
       return;
     } catch (err) {
-      console.warn(`⚠️ Attempt ${attempt} failed`);
-
-      if (attempt === retries) {
-        console.error('❌ All retries failed', err);
-      } else {
-        await new Promise(res => setTimeout(res, 1000 * attempt));
+      lastErr = err;
+      logger.warn('notification_send_attempt_failed', {
+        attempt,
+        retries,
+        error: err.message
+      });
+      if (attempt < retries) {
+        await new Promise((res) => setTimeout(res, 1000 * attempt));
       }
     }
+  }
+  try {
+    await pushNotificationDlq({ payload, error: lastErr, attempts: retries });
+    logger.error('notification_moved_to_dlq', {
+      error: lastErr?.message,
+      to: payload.to
+    });
+  } catch (dlqErr) {
+    logger.error('notification_dlq_write_failed', { error: dlqErr.message });
   }
 }
 
@@ -112,18 +157,17 @@ async function startNotificationListener() {
   const subscriber = redis.duplicate();
   //await subscriber.connect(); // ✅ REQUIRED for v4
 
-  console.log('📡 Notification Service Listening...');
+  logger.info('notification_listener_started');
 
-  await subscriber.subscribe('notification-events', async (message) => {
+  subscriber.on('message', async (_channel, message) => {
     try {
       const event = JSON.parse(message);
       if (!event || !event.event) {
-        console.warn("⚠️ Invalid event received:", event);
+        logger.warn('notification_invalid_event', { raw: String(message).slice(0, 200) });
         return;
       }
-      console.log('📥 Event received:', event.event);
+      logger.info('notification_event_received', { event: event.event });
 
-      // ✅ Rate limit check
       if (await isRateLimited(event)) return;
 
       const payload = {
@@ -132,15 +176,15 @@ async function startNotificationListener() {
         message: event
       };
 
-      // ✅ Non-blocking async processing
-      sendWithRetry(payload).catch(err => {
-        console.error('❌ Async send failed:', err);
+      sendWithRetry(payload).catch((err) => {
+        logger.error('notification_send_unhandled', { error: err.message });
       });
-
     } catch (err) {
-      console.error('❌ Notification listener error:', err);
+      logger.error('notification_listener_error', { error: err.message });
     }
   });
+
+  await subscriber.subscribe('notification-events');
 }
 
 module.exports = { sendNotification, startNotificationListener };

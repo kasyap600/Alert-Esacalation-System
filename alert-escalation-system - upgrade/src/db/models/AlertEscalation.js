@@ -15,7 +15,13 @@ const AlertEscalation = sequelize.define('AlertEscalation', {
   }
 }, {
   tableName: 'alert_escalations',
-  timestamps: false
+  timestamps: false,
+  indexes: [
+    {
+      unique: true,
+      fields: ['alert_id', 'level']
+    }
+  ]
 });
 
 module.exports = AlertEscalation;
