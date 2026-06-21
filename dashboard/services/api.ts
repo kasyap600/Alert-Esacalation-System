@@ -27,13 +27,7 @@ function createClient(): AxiosInstance {
     },
   })
 
-  const key = process.env.NEXT_PUBLIC_ADMIN_API_KEY
-  if (key) {
-    client.interceptors.request.use((config) => {
-      config.headers["x-api-key"] = key
-      return config
-    })
-  }
+  // Key injection is handled server-side in middleware.ts — no client-side secret needed.
 
   return client
 }

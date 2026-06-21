@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const Device = require('../db/models/Device');
+const logger = require('../utils/logger');
 
 router.post('/devices', async (req, res) => {
   try {
@@ -38,8 +39,7 @@ router.post('/devices', async (req, res) => {
     });
 
   } catch (err) {
-    console.error('DB ERROR:', err.message);
-    console.error('ORIGINAL ERROR:', err.original);
+    logger.error('admin_device_create_failed', { error: err.message });
     return res.status(500).json({ error: 'Internal Server Error' });
   }
 });

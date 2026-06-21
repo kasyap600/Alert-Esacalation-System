@@ -61,7 +61,7 @@ async function run() {
         const started = Date.now();
         try {
           const packet = parseEntry(entry);
-          await rulesService.evaluateFromIngestion(packet);
+          await rulesService.evaluate(packet);
           metrics.increment('ruleEval.success');
         } catch (err) {
           metrics.increment('ruleEval.failure');

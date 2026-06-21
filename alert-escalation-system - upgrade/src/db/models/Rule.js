@@ -26,7 +26,7 @@ const Rule = sequelize.define('Rule', {
   },
 
   min_value: {
-    type: DataTypes.FLOAT,
+    type: DataTypes.DOUBLE,
     allowNull: false,
     validate: {
       isFloat: true
@@ -34,7 +34,7 @@ const Rule = sequelize.define('Rule', {
   },
 
   max_value: {
-    type: DataTypes.FLOAT,
+    type: DataTypes.DOUBLE,
     allowNull: false,
     validate: {
       isFloat: true
@@ -59,6 +59,15 @@ const Rule = sequelize.define('Rule', {
   enabled: {
     type: DataTypes.BOOLEAN,
     defaultValue: true
+  },
+
+  trigger_mode: {
+    type: DataTypes.STRING(20),
+    allowNull: false,
+    defaultValue: 'BOTH',
+    validate: {
+      isIn: [['PACKET_ONLY', 'DURATION_ONLY', 'BOTH']]
+    }
   }
 
 }, {

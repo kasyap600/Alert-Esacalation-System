@@ -4,15 +4,12 @@ const logger = require('../utils/logger');
 
 let warnedAdminAuthDisabled;
 
+// Hash both sides to a fixed-length digest before comparing so key length
+// cannot be inferred from timing (the early-exit on length mismatch would leak it).
 function timingSafeEqualString(a, b) {
-  const sa = String(a);
-  const sb = String(b);
-  if (sa.length !== sb.length) return false;
-  try {
-    return crypto.timingSafeEqual(Buffer.from(sa, 'utf8'), Buffer.from(sb, 'utf8'));
-  } catch {
-    return false;
-  }
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
 }
 
 function requireApiKey(req, res, next) {
@@ -39,6 +36,9 @@ function requireApiKey(req, res, next) {
 function requireIngestKey(req, res, next) {
   const expected = process.env.INGEST_API_KEY;
   if (!expected) {
+    if (isEnforcingApiKeys()) {
+      return res.status(503).json({ error: 'INGEST_API_KEY not configured' });
+    }
     return next();
   }
   const provided = req.headers['x-ingest-key'];

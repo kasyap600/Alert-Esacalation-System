@@ -44,10 +44,10 @@ function createApp() {
   const metricsHandler = (_req, res) => {
     res.status(200).json(metrics.snapshot());
   };
-  if (process.env.METRICS_REQUIRE_AUTH === 'true') {
-    app.get('/metrics', requireApiKey, metricsHandler);
-  } else {
+  if (process.env.METRICS_REQUIRE_AUTH === 'false') {
     app.get('/metrics', metricsHandler);
+  } else {
+    app.get('/metrics', requireApiKey, metricsHandler);
   }
 
   const ingestionRoutes = require('./ingestion/ingestion.routes');
@@ -69,6 +69,7 @@ function createApp() {
   app.use('/api/devices', requireApiKey, deviceRoutes);
 
   app.use('/api/alerts', requireApiKey, require('./alerts/alert.routes'));
+  app.use('/api/telemetry', requireApiKey, require('./telemetry/telemetry.routes'));
 
   app.use((err, _req, res, _next) => {
     logger.error('unhandled_http_error', { error: err.message });

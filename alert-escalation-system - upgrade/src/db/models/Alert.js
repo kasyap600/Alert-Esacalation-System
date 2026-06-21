@@ -5,7 +5,9 @@ const Alert = sequelize.define('Alert', {
 
   rule_id: {
     type: DataTypes.INTEGER,
-    allowNull: false
+    allowNull: true,
+    references: { model: 'rules', key: 'id' },
+    onDelete: 'SET NULL'
   },
 
   device_id: {
@@ -77,7 +79,9 @@ const Alert = sequelize.define('Alert', {
   indexes: [
     { fields: ['status', 'current_level'] },
     { fields: ['device_id', 'metric_name'] },
-    { fields: ['rule_id'] }
+    { fields: ['rule_id'] },
+    { fields: ['triggered_at'] },
+    { fields: ['status'] }
   ]
 });
 

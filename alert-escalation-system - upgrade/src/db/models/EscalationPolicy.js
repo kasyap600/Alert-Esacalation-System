@@ -4,7 +4,9 @@ const sequelize = require('../index');
 const EscalationPolicy = sequelize.define('EscalationPolicy', {
   rule_id: {
     type: DataTypes.INTEGER,
-    allowNull: false
+    allowNull: false,
+    references: { model: 'rules', key: 'id' },
+    onDelete: 'CASCADE'
   },
   level: {
     type: DataTypes.INTEGER,

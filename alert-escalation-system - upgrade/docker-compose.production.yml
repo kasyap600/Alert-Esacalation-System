@@ -48,6 +48,17 @@ services:
       - api
       - redis
 
+  mqtt-worker:
+    build: .
+    command: npm run start:mqtt-worker
+    env_file:
+      - .env.example
+    depends_on:
+      - api
+      - redis
+    profiles:
+      - mqtt
+
   postgres:
     image: postgres:16
     environment:

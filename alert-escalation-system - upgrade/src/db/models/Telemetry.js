@@ -24,6 +24,10 @@ const Telemetry = sequelize.define('Telemetry', {
   timestamps: true,
   createdAt: 'created_at',
   updatedAt: false,
+  indexes: [
+    { fields: ['device_id'] },
+    { fields: ['timestamp'] }
+  ]
 });
 
 module.exports = Telemetry;

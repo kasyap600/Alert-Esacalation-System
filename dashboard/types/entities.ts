@@ -1,4 +1,5 @@
 export type RuleSeverity = "LOW" | "MEDIUM" | "HIGH"
+export type TriggerMode = "PACKET_ONLY" | "DURATION_ONLY" | "BOTH"
 
 export interface RuleRow {
   id: number
@@ -10,6 +11,7 @@ export interface RuleRow {
   duration_minutes: number
   severity: RuleSeverity
   enabled: boolean
+  trigger_mode: TriggerMode
 }
 
 export interface AlertRow {
@@ -20,4 +22,5 @@ export interface AlertRow {
   severity?: RuleSeverity
   status: "OPEN" | "ACKNOWLEDGED" | "RESOLVED"
   triggered_at?: string
+  current_level?: number
 }

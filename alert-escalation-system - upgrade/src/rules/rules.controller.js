@@ -3,29 +3,29 @@ const router = express.Router();
 
 const rulesService = require('./rules.service');
 const { validateRulePayload } = require('../validation/validators');
+const logger = require('../utils/logger');
 
 /**
  * GET /api/rules
  * Fetch all rules
  */
 router.get('/', async (req, res) => {
-
   try {
+    const { page = 1, limit = 50, deviceId } = req.query;
+    const pageNum  = Math.max(1, parseInt(page, 10)  || 1);
+    const limitNum = Math.min(200, Math.max(1, parseInt(limit, 10) || 50));
+    const offset   = (pageNum - 1) * limitNum;
 
-    const rules = await rulesService.getAllRules();
+    const { count, rows } = await rulesService.getAllRules({ limit: limitNum, offset, deviceId });
 
-    res.status(200).json(rules);
-
-  } catch (error) {
-
-    console.error('Error fetching rules:', error);
-
-    res.status(500).json({
-      error: 'Failed to fetch rules'
+    res.status(200).json({
+      data: rows,
+      pagination: { total: count, page: pageNum, limit: limitNum, pages: Math.ceil(count / limitNum) }
     });
-
+  } catch (error) {
+    logger.error('rules_list_failed', { error: error.message });
+    res.status(500).json({ error: 'Failed to fetch rules' });
   }
-
 });
 
 
@@ -51,7 +51,7 @@ router.get('/:ruleId', async (req, res) => {
 
   } catch (error) {
 
-    console.error('Error fetching rule:', error);
+    logger.error('rule_get_failed', { error: error.message });
 
     res.status(500).json({
       error: 'Failed to fetch rule'
@@ -84,7 +84,7 @@ router.post('/', async (req, res) => {
 
   } catch (error) {
 
-    console.error('Error creating rule:', error);
+    logger.error('rule_create_failed', { error: error.message });
 
     if (error.code === '23505') {
       return res.status(409).json({
@@ -118,22 +118,20 @@ router.put('/:ruleId', async (req, res) => {
         error: validation.error
       });
     }
-    const rule = await rulesService.updateRule(ruleId, validation.value);
+    const result = await rulesService.updateRule(ruleId, validation.value);
 
-    if (!rule) {
-      return res.status(404).json({
-        error: 'Rule not found'
-      });
+    if (!result) {
+      return res.status(404).json({ error: 'Rule not found' });
     }
 
     res.json({
       message: 'Rule updated successfully',
-      rule
+      rule: result.rule
     });
 
   } catch (error) {
 
-    console.error('Error updating rule:', error);
+    logger.error('rule_update_failed', { error: error.message });
 
     res.status(500).json({
       error: 'Failed to update rule'
@@ -161,7 +159,7 @@ router.delete('/:ruleId', async (req, res) => {
       message: 'Rule deleted successfully'
     });
   } catch (error) {
-    console.error('Error deleting rule:', error);
+    logger.error('rule_delete_failed', { error: error.message });
     res.status(500).json({
       error: 'Failed to delete rule'
     });

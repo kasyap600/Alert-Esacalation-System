@@ -1,14 +1,24 @@
 const crypto = require('crypto');
 const { Device } = require('../db/models');
 
-// ✅ GET all devices
+// ✅ GET all devices (paginated)
 async function getAllDevices(req, res) {
   try {
-    const devices = await Device.findAll({
-      order: [['device_id', 'ASC']]
+    const { page = 1, limit = 50 } = req.query;
+    const pageNum  = Math.max(1, parseInt(page, 10)  || 1);
+    const limitNum = Math.min(200, Math.max(1, parseInt(limit, 10) || 50));
+    const offset   = (pageNum - 1) * limitNum;
+
+    const { count, rows } = await Device.findAndCountAll({
+      order: [['device_id', 'ASC']],
+      limit: limitNum,
+      offset
     });
 
-    res.json(devices);
+    res.json({
+      data: rows,
+      pagination: { total: count, page: pageNum, limit: limitNum, pages: Math.ceil(count / limitNum) }
+    });
   } catch (err) {
     console.error('Error fetching devices:', err);
     res.status(500).json({ error: 'Failed to fetch devices' });
@@ -51,7 +61,7 @@ async function createDevice(req, res) {
       is_active: true
     });
 
-    await device.update({ device_id: String(device.id) });
+    await device.update({ device_id: `device-${device.id}` });
     await device.reload();
 
     return res.status(201).json(device);

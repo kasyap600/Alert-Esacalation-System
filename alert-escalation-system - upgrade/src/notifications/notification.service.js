@@ -16,6 +16,7 @@ async function pushNotificationDlq({ payload, error, attempts }) {
   const event = payload.message || payload;
   await redis.xadd(
     NOTIFICATION_DLQ_STREAM,
+    'MAXLEN', '~', '1000',
     '*',
     'event',
     JSON.stringify(event),
@@ -31,14 +32,15 @@ async function pushNotificationDlq({ payload, error, attempts }) {
 // ===============================
 // Create Transporter
 // ===============================
+const emailPort = parseInt(process.env.EMAIL_PORT, 10) || 587;
 const transporter = nodemailer.createTransport({
-  host: process.env.EMAIL_HOST,
-  port: Number(process.env.EMAIL_PORT),
-  secure: Number(process.env.EMAIL_PORT) === 465,
-  auth: {
+  host: process.env.EMAIL_HOST || 'localhost',
+  port: emailPort,
+  secure: emailPort === 465,
+  auth: process.env.EMAIL_USER ? {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
-  }
+  } : undefined
 });
 
 // ===============================
@@ -53,19 +55,21 @@ transporter.verify((error) => {
 });
 
 // ===============================
-// Rate Limiter (per device)
+// Rate Limiter (per device+metric+severity)
 // ===============================
 async function isRateLimited(event) {
-  const key = `alert:${event.deviceId}`;
+  // Scope the bucket to device+metric so a burst on one metric doesn't suppress
+  // legitimate notifications for other metrics on the same device.
+  const key = `notif:rl:${event.deviceId}:${event.metric || ''}`;
 
   const count = await redis.incr(key);
 
   if (count === 1) {
-    await redis.expire(key, 60); // 1 min window
+    await redis.expire(key, 60); // 1-minute window
   }
 
   if (count > 5) {
-    logger.warn('notification_rate_limited', { deviceId: event.deviceId });
+    logger.warn('notification_rate_limited', { deviceId: event.deviceId, metric: event.metric });
     return true;
   }
 
@@ -87,7 +91,10 @@ async function sendNotification({ channel, to, message }) {
     return;
   }
 
-  const subject = `[ALERT] ${message.deviceId} - ${message.metric}`;
+  // Strip control characters to prevent SMTP header injection
+  const safeDeviceId = String(message.deviceId || '').replace(/[\r\n]/g, '');
+  const safeMetric = String(message.metric || '').replace(/[\r\n]/g, '');
+  const subject = `[ALERT] ${safeDeviceId} - ${safeMetric}`;
 
   const thresholdText =
     message.min != null && message.max != null
@@ -155,7 +162,6 @@ async function sendWithRetry(payload) {
 async function startNotificationListener() {
 
   const subscriber = redis.duplicate();
-  //await subscriber.connect(); // ✅ REQUIRED for v4
 
   logger.info('notification_listener_started');
 
